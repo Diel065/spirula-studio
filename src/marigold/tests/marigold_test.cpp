@@ -1,13 +1,13 @@
 // Marigold v2: the installer's host arithmetic, the installed files against the
-// reference's constants, and a prediction with its stages dumped for
-// tools/marigold/reference.py. Runs what it can and SKIPs the rest.
+// reference's constants, a prediction with its stages dumped for
+// tools/marigold/reference.py, and the VAE alone. Runs what it can, SKIPs the rest.
 //
 //   marigold_test                           host checks; a small prediction if installed
 //   marigold_test --install depth,normals   fetch and convert (~43 GB streamed)
 //   marigold_test --constants <ref dir>     installed constants vs a reference run's dumps
-//   marigold_test --image IMG|--rgb X.npy [--task depth|normals|both] [--tokens N]
-//                 [--repeat N] [--batch N] [--out DIR]
-//                                           a prediction; SS_MARIGOLD_DUMP=<dir> for stages
+//   marigold_test --image IMG|--rgb X.npy [--task T|both] [--tokens N] [--repeat N] [--batch N]
+//   marigold_test --vae WxH [--image IMG] [--latent Z.npy] [--task T] [--repeat N]
+//                 --out DIR keeps the outputs; SS_MARIGOLD_DUMP=<dir> a prediction's stages
 
 #include "marigold/Common.h"
 #include "marigold/Marigold.h"
@@ -15,13 +15,18 @@
 #include "marigold/model/HostMath.h"
 #include "marigold/model/Install.h"
 #include "marigold/model/Layout.h"
+#include "marigold/model/Vae.h"
+#include "nn/Ops.h"
+#include "nn/vk/Context.h"
 #include "nn/vk/Memory.h"
 #include "nn/vk/Stream.h"
 #include "nn/Device.h"
 #include "nn/io/Image.h"
+#include "nn/io/Resize.h"
 #include "nn/io/Safetensors.h"
 #include "nn/io/StageDump.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -80,13 +85,18 @@ void compare(const nn::SafetensorsFile& f, const std::string& ours, const std::s
              const std::string& name, double within) {
     std::vector<float> want;
     std::vector<int64_t> shape;
-    if (!nn::read_npy_f32(ref_dir + "/" + name + ".npy", want, shape)) {
+    const std::string path = ref_dir + "/" + name + ".npy";
+    if (!std::ifstream(path)) {
         std::printf("  SKIP %s (no %s.npy)\n", ours.c_str(), name.c_str());
+        return;
+    }
+    if (!nn::read_npy_f32(path, want, shape)) {
+        check(false, (path + ": not a readable C-order float32 .npy").c_str());
         return;
     }
     const nn::OnnxTensor got = f.read(ours);
     const size_t n = want.size();
-    if (got.data.size() < n || want.size() < n) {
+    if (n == 0 || got.data.size() < n) {
         check(false, (ours + ": size differs from the reference").c_str());
         return;
     }
@@ -115,22 +125,29 @@ void test_constants(const std::string& ref, Task t) {
     compare(base, "temb", ref, "temb", 0.999);
     std::vector<float> mods;
     std::vector<int64_t> shape;
-    for (const char* s : {"img", "txt"})
-        if (nn::read_npy_f32(ref + "/mod_" + s + ".npy", mods, shape)) {
-            size_t off = 0;
-            for (int i = 0; i < kLayers; ++i) {
-                const nn::OnnxTensor got =
-                    base.read(block_tensor(i, s[0] == 'i' ? "mod_img" : "mod_txt"));
-                for (size_t k = 0; k < got.data.size(); ++k) {
-                    const float b = mods[(size_t)i * got.data.size() + k];
-                    if (std::fabs(got.data[k] - b) > std::fabs(b) / 128.0f + 1e-6f) ++off;
-                }
-            }
-            char line[128];
-            std::snprintf(line, sizeof line, "mod_%s: %zu of %zu past one bf16 step", s, off,
-                          mods.size());
-            check(off <= mods.size() / 100, line);
+    for (const char* s : {"img", "txt"}) {
+        const std::string path = ref + "/mod_" + s + ".npy";
+        if (!std::ifstream(path)) continue;
+        if (!nn::read_npy_f32(path, mods, shape)) {
+            check(false, (path + ": not a readable C-order float32 .npy").c_str());
+            continue;
         }
+        size_t off = 0;
+        bool whole = true;
+        for (int i = 0; i < kLayers && whole; ++i) {
+            const nn::OnnxTensor got =
+                base.read(block_tensor(i, s[0] == 'i' ? "mod_img" : "mod_txt"));
+            whole = mods.size() >= (size_t)(i + 1) * got.data.size();
+            for (size_t k = 0; whole && k < got.data.size(); ++k) {
+                const float b = mods[(size_t)i * got.data.size() + k];
+                if (std::fabs(got.data[k] - b) > std::fabs(b) / 128.0f + 1e-6f) ++off;
+            }
+        }
+        char line[128];
+        std::snprintf(line, sizeof line, "mod_%s: %zu of %zu past one bf16 step", s, off,
+                      mods.size());
+        check(whole && off <= mods.size() / 100, line);
+    }
     compare(task, "txt", ref, "txt0", 0.95);
     compare(task, "norm_out", ref, "norm_out", 0.95);
 }
@@ -247,12 +264,198 @@ int run_prediction(const std::string& image, const std::string& npy, const std::
     return 0;
 }
 
+// [0, 1] RGB: a ramp, a zone plate reaching Nyquist, 1- and 2-pixel checkers, a
+// hard-edged disc and hashed noise, the structures a strip boundary could disturb.
+std::vector<float> vae_pattern(int W, int H) {
+    std::vector<float> v((size_t)W * H * 3);
+    const float k = 3.14159265f / (float)W;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            float* p = &v[((size_t)y * W + x) * 3];
+            const bool right = 2 * x >= W, low = 2 * y >= H;
+            float c[3] = {0.15f + 0.7f * x / W, 0.15f + 0.7f * y / H, 0.5f};
+            if (right && !low) {
+                const float dx = x - 0.75f * W, dy = y - 0.25f * H;
+                c[0] = c[1] = c[2] = 0.5f + 0.45f * std::cos(k * (dx * dx + dy * dy));
+            } else if (!right && low) {
+                const int s = 4 * y >= 3 * H ? 0 : 1;
+                c[0] = c[1] = c[2] = (((x >> s) + (y >> s)) & 1) ? 0.9f : 0.1f;
+            } else if (right && low) {
+                const float dx = x - 0.75f * W, dy = y - 0.75f * H, r = 0.2f * std::min(W, H);
+                if (dx * dx + dy * dy < r * r) c[0] = 0.95f, c[1] = 0.3f, c[2] = 0.05f;
+            }
+            uint32_t s = (uint32_t)y * 73856093u ^ (uint32_t)x * 19349663u;
+            for (int i = 0; i < 3; ++i) {
+                s = s * 1664525u + 1013904223u;
+                p[i] = std::clamp(c[i] + 0.04f * ((float)(s >> 8) / 16777216.0f - 0.5f), 0.0f, 1.0f);
+            }
+        }
+    return v;
+}
+
+double sync_ms() {
+    vk::Stream::get().sync();
+    return now_ms();
+}
+
+// Encode and decode a pattern at the default band size and at one small enough
+// to stream every level in many steps: streaming must not change a bit.
+void test_vae_bands() {
+    std::printf("VAE bands\n");
+    if (!base_installed() || !task_installed(Task::Depth)) {
+        std::printf("  SKIP not installed\n");
+        return;
+    }
+    const int W = 320, H = 240, h = H / 8, w = W / 8;
+    const nn::SafetensorsFile base(base_path()), tf(task_path(Task::Depth));
+    Vae enc, dec;
+    enc.load(base, true, "marigold.encoder");
+    dec.load(tf, false, "marigold.decoder");
+    const std::vector<float> rgb = vae_pattern(W, H);
+    vk::Arena a{"vae bands"};
+    // Tensor cores and MPSGraph take only GEMMs of 128 rows or more, and round
+    // differently: off, so a band's row count cannot change the arithmetic.
+    struct FixedGemm {
+        bool coop = nn::coop_matrix_enabled(), metal = nn::metal_enabled();
+        FixedGemm() { nn::set_coop_matrix_enabled(false), nn::set_metal_enabled(false); }
+        ~FixedGemm() { nn::set_coop_matrix_enabled(coop), nn::set_metal_enabled(metal); }
+    } fixed;
+    a.reserve(Vae::arenaBytes(H, W) + (uint64_t)h * w * kLatent * 4 + (2ull << 20));
+    std::vector<float> out[2];
+    for (int k = 0; k < 2; ++k) {
+        enc.setStep(k ? 512 : 0);
+        dec.setStep(k ? 512 : 0);
+        vk::ArenaScope scope(a);
+        nn::Tensor x = nn::arena_tensor(a, nn::DType::F32, H, W, 3);
+        nn::Tensor mu = nn::arena_tensor(a, nn::DType::F32, h, w, kLatent);
+        nn::tensor_from_host(x, rgb.data(), x.numel());
+        nn::unary(x, x, nn::Act::None, 2.0f, -1.0f);
+        enc.encode(a, x, mu);
+        dec.decode(a, mu, x);
+        out[k].resize((size_t)x.numel() + mu.numel());
+        nn::tensor_to_host(mu, out[k].data(), mu.numel());
+        nn::tensor_to_host(x, out[k].data() + mu.numel(), x.numel());
+    }
+    check(std::memcmp(out[0].data(), out[1].data(), out[0].size() * 4) == 0,
+          "the streamed VAE gives the same bits at another band size");
+}
+
+// The VAE alone: encode, then decode the posterior mean (or --latent) with the
+// task's decoder. Each pass gets its own arena, so each high water is its own.
+int run_vae(int W, int H, const std::string& image, const std::string& latent, Task task,
+            int repeat, const std::string& out) {
+    std::printf("VAE\n");
+    if (!base_installed() || !task_installed(task)) {
+        std::printf("  SKIP not installed\n");
+        return 0;
+    }
+    NN_CHECK(W % 16 == 0 && H % 16 == 0 && W > 0 && H > 0, "--vae: W and H must be multiples of 16");
+    std::vector<float> rgb;
+    if (image.empty()) {
+        rgb = vae_pattern(W, H);
+    } else {
+        const nn::Image img = nn::load_image(image);
+        NN_CHECK(!img.empty(), "cannot read %s", image.c_str());
+        std::vector<float> f(img.data.size());
+        for (size_t i = 0; i < f.size(); ++i) f[i] = img.data[i] / 255.0f;
+        rgb = img.width == W && img.height == H
+                  ? f
+                  : nn::resize_rgb_bicubic(f.data(), img.width, img.height, W, H);
+    }
+    const int h = H / 8, w = W / 8;
+    const vk::Context& ctx = vk::Context::get();
+    const uint64_t dev0 = ctx.memoryBudget().usage_bytes;
+    const nn::SafetensorsFile base(base_path()), tf(task_path(task));
+    Vae enc, dec;
+    enc.load(base, true, "marigold.encoder");
+    dec.load(tf, false, "marigold.decoder");
+    const uint64_t dev1 = ctx.memoryBudget().usage_bytes;
+    const uint64_t lat_bytes = (uint64_t)h * w * kLatent * 4;
+    const uint64_t reserve = Vae::arenaBytes(H, W) + lat_bytes + (2ull << 20);
+    std::printf("  %dx%d, latent %dx%d; weights %.1f MB encoder, %.1f MB decoder; arena %.1f MB\n",
+                W, H, w, h, enc.deviceBytes() / 1e6, dec.deviceBytes() / 1e6, reserve / 1e6);
+
+    std::vector<double> te, td;
+    std::vector<float> mu_host((size_t)h * w * kLatent);
+    uint64_t enc_hw = 0, dec_hw = 0, dev_enc = 0, dev_dec = 0;
+    {
+        vk::Arena a{"vae bench"};
+        a.reserve(reserve);
+        dev_enc = ctx.memoryBudget().usage_bytes;
+        nn::Tensor x = nn::arena_tensor(a, nn::DType::F32, H, W, 3);
+        nn::Tensor mu = nn::arena_tensor(a, nn::DType::F32, h, w, kLatent);
+        nn::tensor_from_host(x, rgb.data(), x.numel());
+        nn::unary(x, x, nn::Act::None, 2.0f, -1.0f);
+        const uint64_t io = a.mark();
+        for (int r = 0; r < repeat; ++r) {
+            const double t0 = sync_ms();
+            enc.encode(a, x, mu);
+            te.push_back(sync_ms() - t0);
+        }
+        enc_hw = a.highWater() - io;
+        nn::tensor_to_host(mu, mu_host.data(), mu.numel());
+    }
+    std::vector<float> z_host = mu_host;
+    if (!latent.empty()) {
+        std::vector<int64_t> shape;
+        NN_CHECK(nn::read_npy_f32(latent, z_host, shape) && shape.size() == 3 && shape[0] == h &&
+                     shape[1] == w && shape[2] == kLatent,
+                 "%s: not a [%d, %d, %d] float32 array", latent.c_str(), h, w, kLatent);
+    }
+    std::vector<float> dec_host((size_t)W * H * 3);
+    {
+        vk::Arena a{"vae bench"};
+        a.reserve(reserve);
+        dev_dec = ctx.memoryBudget().usage_bytes;
+        nn::Tensor z = nn::arena_tensor(a, nn::DType::F32, h, w, kLatent);
+        nn::Tensor y = nn::arena_tensor(a, nn::DType::F32, H, W, 3);
+        nn::tensor_from_host(z, z_host.data(), z.numel());
+        const uint64_t io = a.mark();
+        for (int r = 0; r < repeat; ++r) {
+            const double t0 = sync_ms();
+            dec.decode(a, z, y);
+            td.push_back(sync_ms() - t0);
+        }
+        dec_hw = a.highWater() - io;
+        nn::tensor_to_host(y, dec_host.data(), y.numel());
+    }
+    auto list = [](const std::vector<double>& t) {
+        std::string s;
+        for (double v : t) s += (s.empty() ? "" : ",") + std::to_string(v);
+        return s;
+    };
+    bool finite = true;
+    for (float v : mu_host) finite = finite && std::isfinite(v);
+    for (float v : dec_host) finite = finite && std::isfinite(v);
+    std::printf("  encode %.1f ms (first %.1f), decode %.1f ms (first %.1f)\n", te.back(), te[0],
+                td.back(), td[0]);
+    std::printf("  high water: encode %.1f MB, decode %.1f MB (%.0f and %.0f B a pixel)\n",
+                enc_hw / 1e6, dec_hw / 1e6, (double)enc_hw / ((double)W * H),
+                (double)dec_hw / ((double)W * H));
+    std::printf("VAEBENCH {\"W\":%d,\"H\":%d,\"task\":\"%s\",\"enc_ms\":[%s],\"dec_ms\":[%s],"
+                "\"enc_hw\":%llu,\"dec_hw\":%llu,\"reserve\":%llu,\"alloc_peak\":%llu,"
+                "\"dev_before_load\":%llu,\"dev_loaded\":%llu,\"dev_enc\":%llu,\"dev_dec\":%llu}\n",
+                W, H, task_name(task), list(te).c_str(),
+                list(td).c_str(), (unsigned long long)enc_hw, (unsigned long long)dec_hw,
+                (unsigned long long)reserve,
+                (unsigned long long)vk::Allocator::get().peakBytes(), (unsigned long long)dev0,
+                (unsigned long long)dev1, (unsigned long long)dev_enc,
+                (unsigned long long)dev_dec);
+    vk::Stream::get().report();
+    if (!out.empty()) {
+        nn::write_npy_f32(out + "/mu.npy", mu_host.data(), {h, w, kLatent});
+        nn::write_npy_f32(out + "/dec.npy", dec_host.data(), {H, W, 3});
+    }
+    check(finite, "VAE output is finite");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     nn::set_log_level(2);
-    std::string to_install, constants, image, npy, tasks = "both", out;
-    int tokens = 3600, repeat = 1, batch = 1;
+    std::string to_install, constants, image, npy, latent, tasks = "both", out;
+    int tokens = 3600, repeat = 1, batch = 1, vae_w = 0, vae_h = 0;
     Task task = Task::Depth;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -268,6 +471,9 @@ int main(int argc, char** argv) {
         else if (a == "--repeat" && i + 1 < argc) repeat = std::atoi(argv[++i]);
         else if (a == "--batch" && i + 1 < argc) batch = std::max(1, std::atoi(argv[++i]));
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
+        else if (a == "--latent" && i + 1 < argc) latent = argv[++i];
+        else if (a == "--vae" && i + 1 < argc)
+            std::sscanf(argv[++i], "%dx%d", &vae_w, &vae_h);
     }
     try {
         if (!to_install.empty()) {
@@ -291,10 +497,14 @@ int main(int argc, char** argv) {
         }
         test_host_math();
         if (!constants.empty()) test_constants(constants, task);
-        if (!image.empty() || !npy.empty())
+        if (vae_w > 0)
+            run_vae(vae_w, vae_h, image, latent, task, std::max(1, repeat), out);
+        else if (!image.empty() || !npy.empty())
             run_prediction(image, npy, tasks, tokens, repeat, batch, out);
-        else if (constants.empty())
+        else if (constants.empty()) {
+            test_vae_bands();
             run_prediction("", "", "both", 192, 1, 2, "", true);
+        }
     } catch (const std::exception& e) {
         std::printf("EXCEPTION: %s\n", e.what());
         nn::shutdown();
