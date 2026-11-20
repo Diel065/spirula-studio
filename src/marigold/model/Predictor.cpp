@@ -69,7 +69,6 @@ struct Predictor::Impl {
     Streamer streamer;
     vk::Arena arena{"marigold"};
     bool have[2] = {};
-    int plan_w = 0, plan_h = 0, plan_batch = 0;
     Task last = Task::Normals;
     nn::StageDump dump{"MARIGOLD_DUMP"};
 
@@ -107,25 +106,23 @@ struct Predictor::Impl {
     void run(int pw, int ph, const std::vector<Image>& images, const std::vector<size_t>& idx,
              const PredictOptions& o, std::vector<Prediction>& out);
 
+    // Grows to what this request needs; never sized from earlier requests' shapes,
+    // whose largest image and largest batch need not come together. Resident blocks
+    // the larger arena displaces go first, so the reserve can succeed.
     void plan(int pw, int ph, int batch) {
-        const bool larger = (int64_t)pw * ph > (int64_t)plan_w * plan_h;
-        if (!larger && batch <= plan_batch) return;
-        if (larger) {
-            plan_w = pw;
-            plan_h = ph;
-        }
-        plan_batch = std::max(plan_batch, batch);
-        const uint64_t act = activations(plan_w, plan_h, plan_batch) + (64ull << 20);
-        if (arena.capacity() < act) {
-            arena.release();
-            arena.reserve(act);
-        }
+        // A block's unit is sized by the LoRA it carries: none before a task is loaded.
+        NN_CHECK(std::find(std::begin(have), std::end(have), true) != std::end(have),
+                 "Marigold v2: load a task before sizing a pass");
+        const uint64_t need = activations(pw, ph, batch) + (64ull << 20);
+        if (need <= arena.capacity()) return;
         const uint64_t room = budget();
-        NN_CHECK(room > arena.capacity(),
+        NN_CHECK(room > need,
                  "Marigold v2 needs %.1f GB of GPU memory for a %dx%d image's activations and "
                  "the device has %.1f GB to give; lower --num-tokens",
-                 arena.capacity() / 1e9, pw, ph, (room + kHeadroom) / 1e9);
-        streamer.plan(room - arena.capacity());
+                 need / 1e9, pw, ph, (room + kHeadroom) / 1e9);
+        arena.release();
+        streamer.plan(room - need);
+        arena.reserve(need);
     }
 };
 
