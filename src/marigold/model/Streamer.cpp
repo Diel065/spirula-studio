@@ -29,6 +29,15 @@ std::vector<std::string> base_tensor_names(int i) {
     return v;
 }
 
+// The task a task file holds, from the name the installer wrote into it.
+Task task_of(const nn::SafetensorsFile& f) {
+    const std::string& name = f.metadata().at("task");
+    for (int k = 0; k < kTasks; ++k)
+        if (name == task_name((Task)k)) return (Task)k;
+    NN_CHECK(false, "%s: unknown task '%s'", f.path().c_str(), name.c_str());
+    return Task::Depth;
+}
+
 std::vector<std::string> lora_tensor_names(int i) {
     std::vector<std::string> v;
     for (const BlockLinear& L : kBlockLinears)
@@ -53,7 +62,8 @@ Streamer::~Streamer() {
         vk::Allocator::get().free(slots_[k]);
         vk::Allocator::get().free(staging_[k]);
     }
-    for (std::FILE* f : {base_file_, task_file_[0], task_file_[1]})
+    if (base_file_) std::fclose(base_file_);
+    for (std::FILE* f : task_file_)
         if (f) std::fclose(f);
 }
 
@@ -76,8 +86,7 @@ void Streamer::layout(const nn::SafetensorsFile& f, bool lora, Part* parts) {
         // Contiguous, with nothing but alignment filler between: one read, one copy.
         NN_CHECK(hi - lo <= sum, "%s: block %d is not stored contiguously", f.path().c_str(), i);
         parts[i] = {nullptr, f.dataOffset() + lo, hi - lo};
-        auto& offs = lora ? lora_names_[f.metadata().at("task") == "depth" ? 0 : 1][i]
-                          : base_names_[i];
+        auto& offs = lora ? lora_names_[(int)task_of(f)][i] : base_names_[i];
         offs.clear();
         for (const std::string& n : names) offs.emplace_back(n, f.entry(n).begin - lo);
     }

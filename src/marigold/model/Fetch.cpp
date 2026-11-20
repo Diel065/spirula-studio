@@ -35,28 +35,37 @@ const RemoteFile kVae = {
 
 // The default depth model is the paper's (Log-stage2): affine-invariant LOG
 // depth. Its prompt context was embedded from real 512 px images.
-const RemoteFile kTrainables[2] = {
+const RemoteFile kTrainables[kTasks] = {
     MV2("depth/Log-stage2/trainables.safetensors",
         "3edec69490ba8e8fdc8d63e130f93cb93f514360d415a22701250b2535056892", 1853909694ull),
     MV2("normals/trainables.safetensors",
         "b98dfcafa8cf86cf042d8a8e615b8b1a7d7f17c939f1716954c1b57b1b4af15a", 1853909694ull),
+    MV2("albedo/trainables.safetensors",
+        "dd955f940becbadb0cf854f51608ed8febec0636891467c05060bc44129d2503", 1853909694ull),
 };
-const RemoteFile kEmbeds[2] = {
+const RemoteFile kEmbeds[kTasks] = {
     MV2("qwen_text_embeddings/qwen_edit_2509_qwen_depth_realimg512_prompt_embeds.pt",
         "ba752b582571d990c75ad6aac2a2eeb0cf04c2fe01b233b1675028eabf342a6d", 19384278ull),
     MV2("qwen_text_embeddings/qwen_edit_2509_qwen_normals_dummy512_prompt_embeds.pt",
         "411c502723f2aded4265bd9f3f7032bd9f861a317922628d2aaa82424f436217", 2538995ull),
+    MV2("qwen_text_embeddings/qwen_edit_2509_qwen_albedo_rgb_dummy512_prompt_embeds.pt",
+        "4a3aafb282ffff7f3b6f20aaa2b58d57f836bbcb5eb58e8ec55904bb45564863", 2575339ull),
 };
-const RemoteFile kMasks[2] = {
+const RemoteFile kMasks[kTasks] = {
     MV2("qwen_text_embeddings/qwen_edit_2509_qwen_depth_realimg512_prompt_mask.pt",
         "80973a6521f21a5a6faf6402cae185dafef840d91e654efbeb1097914e634798", 23624ull),
     MV2("qwen_text_embeddings/qwen_edit_2509_qwen_normals_dummy512_prompt_mask.pt",
         "202dcf62ae9963730237226d8df893b0678338ece99a69ef0c9afa894524cd57", 4329ull),
+    MV2("qwen_text_embeddings/qwen_edit_2509_qwen_albedo_rgb_dummy512_prompt_mask.pt",
+        "f03b39976cd4d2a60e4262401c84c9fc324368dec3704d0cd00e9d471aa48df0", 4893ull),
 };
 
 }  // namespace
 
-const char* task_name(Task t) { return t == Task::Depth ? "depth" : "normals"; }
+const char* task_name(Task t) {
+    static const char* const kNames[kTasks] = {"depth", "normals", "albedo"};
+    return kNames[(int)t];
+}
 
 const std::vector<RemoteFile>& transformer_shards() { return kShards; }
 const RemoteFile& vae_file() { return kVae; }

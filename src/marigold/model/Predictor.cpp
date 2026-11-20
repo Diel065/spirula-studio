@@ -63,12 +63,12 @@ uint64_t vram_cap() {
 }  // namespace
 
 struct Predictor::Impl {
-    std::unique_ptr<nn::SafetensorsFile> base, task[2];
-    Vae encoder, decoder[2];
+    std::unique_ptr<nn::SafetensorsFile> base, task[kTasks];
+    Vae encoder, decoder[kTasks];
     Dit dit;
     Streamer streamer;
     vk::Arena arena{"marigold"};
-    bool have[2] = {};
+    bool have[kTasks] = {};
     Task last = Task::Normals;
     nn::StageDump dump{"MARIGOLD_DUMP"};
 
@@ -82,8 +82,8 @@ struct Predictor::Impl {
                                               std::min<uint64_t>(vk::Allocator::get().totalBytes() - ours,
                                                                  ctx.info().vram_bytes);
         if (const uint64_t cap = vram_cap()) {
-            const uint64_t fixed = encoder.deviceBytes() + decoder[0].deviceBytes() +
-                                   decoder[1].deviceBytes() + dit.deviceBytes();
+            uint64_t fixed = encoder.deviceBytes() + dit.deviceBytes();
+            for (const Vae& d : decoder) fixed += d.deviceBytes();
             avail = std::min(avail, cap > fixed ? cap - fixed : 0);
         }
         return avail > kHeadroom ? avail - kHeadroom : 0;
@@ -131,10 +131,12 @@ Predictor::~Predictor() = default;
 
 bool Predictor::loaded() const { return impl_->base != nullptr; }
 
-void Predictor::load(bool want_depth, bool want_normal) {
+void Predictor::load(bool want_depth, bool want_normal, bool want_albedo) {
     Impl& m = *impl_;
-    NN_CHECK(base_installed() && (!want_depth || task_installed(Task::Depth)) &&
-                 (!want_normal || task_installed(Task::Normals)),
+    const bool want[kTasks] = {want_depth, want_normal, want_albedo};
+    bool installed = base_installed();
+    for (int k = 0; k < kTasks; ++k) installed = installed && (!want[k] || task_installed((Task)k));
+    NN_CHECK(installed,
              "Marigold v2 is not installed: `spirula geometry --install marigold-v2` builds it "
              "from Hugging Face's checkpoints (about 45 GB streamed, 11 GB kept)");
     if (!m.base) {
@@ -151,9 +153,9 @@ void Predictor::load(bool want_depth, bool want_normal) {
         }
         m.base = std::move(base);
     }
-    for (Task t : {Task::Depth, Task::Normals}) {
-        const int k = (int)t;
-        if (m.have[k] || !(t == Task::Depth ? want_depth : want_normal)) continue;
+    for (int k = 0; k < kTasks; ++k) {
+        const Task t = (Task)k;
+        if (m.have[k] || !want[k]) continue;
         m.task[k] = std::make_unique<nn::SafetensorsFile>(task_path(t));
         m.decoder[k].load(*m.task[k], false, "marigold.decoder");
         m.dit.loadTask(t, *m.task[k]);
@@ -183,15 +185,18 @@ int Predictor::batchCapacity(int width, int height, int num_tokens) {
 
 uint64_t Predictor::deviceBytes() const {
     const Impl& m = *impl_;
-    return m.encoder.deviceBytes() + m.decoder[0].deviceBytes() + m.decoder[1].deviceBytes() +
-           m.dit.deviceBytes() + m.streamer.deviceBytes() + m.arena.capacity();
+    uint64_t n = m.encoder.deviceBytes() + m.dit.deviceBytes() + m.streamer.deviceBytes() +
+                 m.arena.capacity();
+    for (const Vae& d : m.decoder) n += d.deviceBytes();
+    return n;
 }
 
 std::vector<Prediction> Predictor::predict(const std::vector<Image>& images,
                                            const PredictOptions& o) {
     Impl& m = *impl_;
     NN_CHECK(m.base, "Marigold v2: predict before load");
-    NN_CHECK((!o.want_depth || m.have[0]) && (!o.want_normal || m.have[1]),
+    NN_CHECK((!o.want_depth || m.have[0]) && (!o.want_normal || m.have[1]) &&
+                 (!o.want_albedo || m.have[2]),
              "Marigold v2: a task was asked for that was not loaded");
     // A pass is one processing size, not one input size: a split fisheye's
     // faces differ by a few pixels and land on the same multiple of 16.
@@ -238,11 +243,12 @@ void Predictor::Impl::run(int pw, int ph, const std::vector<Image>& images,
             out[idx[b0 + b]].width = in.width;
             out[idx[b0 + b]].height = in.height;
         }
-        // Alternating the order keeps one task's LoRA resident across batches.
+        // Starting with the last pass's task keeps its LoRA resident across batches.
         std::vector<Task> tasks;
         if (o.want_depth) tasks.push_back(Task::Depth);
         if (o.want_normal) tasks.push_back(Task::Normals);
-        if (tasks.size() == 2 && m.last == Task::Normals) std::swap(tasks[0], tasks[1]);
+        if (o.want_albedo) tasks.push_back(Task::Albedo);
+        std::stable_partition(tasks.begin(), tasks.end(), [&](Task t) { return t == m.last; });
         for (Task t : tasks) {
             m.last = t;
             m.streamer.beginPass(t);
@@ -263,6 +269,11 @@ void Predictor::Impl::run(int pw, int ph, const std::vector<Image>& images,
                         dl[i] = (d[i * 3] + d[i * 3 + 1] + d[i * 3 + 2]) / 3.0f;
                     if (m.dump.on()) m.dump.host("depth_rel", dl.data(), {ph, pw});
                     p.depth_log = resize_linear(dl, pw, ph, 1, p.width, p.height);
+                } else if (t == Task::Albedo) {
+                    // Linear RGB: (decoded + 1) / 2, Marigold v2's FolderRGBAlbedoPrediction;
+                    // its inference script stores x^(1/2.2) of this instead.
+                    for (float& v : d) v = 0.5f * (v + 1.0f);
+                    p.albedo = resize_linear(d, pw, ph, 3, p.width, p.height);
                 } else {
                     // Marigold's normals are OpenGL's axes (y up, z towards the
                     // viewer); the trainer reads OpenCV's.

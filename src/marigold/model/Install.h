@@ -27,7 +27,7 @@ struct InstallNeeds {
     uint64_t free = 0;
     bool fits() const;
 };
-InstallNeeds install_needs(bool depth, bool normals);
+InstallNeeds install_needs(bool depth, bool normals, bool albedo = false);
 
 // Bytes streamed so far, of the total this call streams.
 using InstallProgress = std::function<void(uint64_t done, uint64_t total)>;
@@ -36,6 +36,6 @@ using InstallProgress = std::function<void(uint64_t done, uint64_t total)>;
 // way what was converted stays, and the next call continues from it. Asking
 // first is the caller's: SS_NO_AUTO_FETCH is not consulted here.
 void install(bool depth, bool normals, const InstallProgress& progress,
-             const std::atomic<bool>* cancel);
+             const std::atomic<bool>* cancel, bool albedo = false);
 
 }  // namespace marigold

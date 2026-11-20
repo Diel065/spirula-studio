@@ -71,11 +71,11 @@ private:
     void issue(size_t s);
 
     std::FILE* base_file_ = nullptr;
-    std::FILE* task_file_[2] = {};
-    Part base_parts_[kLayers], lora_parts_[2][kLayers];
+    std::FILE* task_file_[kTasks] = {};
+    Part base_parts_[kLayers], lora_parts_[kTasks][kLayers];
     // Tensor offsets inside a unit, by name, for each source.
     std::vector<std::pair<std::string, uint64_t>> base_names_[kLayers];
-    std::vector<std::pair<std::string, uint64_t>> lora_names_[2][kLayers];
+    std::vector<std::pair<std::string, uint64_t>> lora_names_[kTasks][kLayers];
     uint64_t base_bytes_ = 0, lora_bytes_ = 0;
 
     std::vector<nn::DevicePtr> resident_units_;

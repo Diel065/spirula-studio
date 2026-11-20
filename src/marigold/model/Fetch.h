@@ -20,7 +20,8 @@ struct RemoteFile {
     uint64_t    bytes;
 };
 
-enum class Task { Depth, Normals };
+enum class Task { Depth, Normals, Albedo };
+constexpr int kTasks = 3;
 const char* task_name(Task t);
 
 const std::vector<RemoteFile>& transformer_shards();
@@ -29,7 +30,7 @@ const RemoteFile& trainables(Task t);
 const RemoteFile& prompt_embeds(Task t);
 const RemoteFile& prompt_mask(Task t);
 
-// <cache>/models/marigold-v2/{base,depth,normals}.safetensors
+// <cache>/models/marigold-v2/{base,depth,normals,albedo}.safetensors
 std::string install_dir();
 std::string base_path();
 std::string task_path(Task t);

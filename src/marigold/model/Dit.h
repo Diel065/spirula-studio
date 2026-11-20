@@ -49,8 +49,8 @@ private:
     const std::pair<nn::Tensor, nn::Tensor>& rope(int h, int w, Task t);
 
     nn::WeightStore w_;
-    nn::WeightStore task_w_[2];
-    int text_tokens_[2] = {};
+    nn::WeightStore task_w_[kTasks];
+    int text_tokens_[kTasks] = {};
     nn::DevicePtr w16_ = 0, ba_ = 0, bias_ = 0;
     // (h, w, task) -> image and text RoPE tables, [n, 64, 2] (cos, sin)
     std::map<std::tuple<int, int, int>, std::pair<nn::Tensor, nn::Tensor>> rope_;

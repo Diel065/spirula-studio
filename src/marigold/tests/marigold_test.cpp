@@ -5,7 +5,7 @@
 //   marigold_test                           host checks; a small prediction if installed
 //   marigold_test --install depth,normals   fetch and convert (~43 GB streamed)
 //   marigold_test --constants <ref dir>     installed constants vs a reference run's dumps
-//   marigold_test --image IMG|--rgb X.npy [--task T|both] [--tokens N] [--repeat N] [--batch N]
+//   marigold_test --image IMG|--rgb X.npy [--task T|both|all] [--tokens N] [--repeat N] [--batch N]
 //   marigold_test --vae WxH [--image IMG] [--latent Z.npy] [--task T] [--repeat N]
 //                 --out DIR keeps the outputs; SS_MARIGOLD_DUMP=<dir> a prediction's stages
 
@@ -25,6 +25,7 @@
 #include "nn/io/Resize.h"
 #include "nn/io/Safetensors.h"
 #include "nn/io/StageDump.h"
+#include "core/BufferedFile.h"
 
 #include <algorithm>
 #include <cmath>
@@ -152,7 +153,38 @@ void test_constants(const std::string& ref, Task t) {
     compare(task, "norm_out", ref, "norm_out", 0.95);
 }
 
+// Portable float map, bottom row first: what pbrt-v4 and HDR tools read.
+void save_pfm(const std::string& path, const std::vector<float>& v, int w, int h, int c) {
+    spirula::BufferedOutputFile f(path, std::ios::binary);
+    f << (c == 3 ? "PF" : "Pf") << "\n" << w << " " << h << "\n-1.0\n";
+    for (int y = h - 1; y >= 0; --y)
+        f.write(reinterpret_cast<const char*>(&v[(size_t)y * w * c]), (std::streamsize)w * c * 4);
+    f.close();
+    NN_CHECK(!f.fail(), "cannot write %s", path.c_str());
+}
+
+void save_png(const nn::Image& img, const std::string& path) {
+    NN_CHECK(nn::save_image(img, path, -1), "cannot write %s", path.c_str());
+}
+
+float srgb_encode(float v) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+}
+
 void save_outputs(const Prediction& p, const std::string& dir) {
+    if (!p.depth_log.empty()) save_pfm(dir + "/depth_log.pfm", p.depth_log, p.width, p.height, 1);
+    if (!p.normal.empty()) save_pfm(dir + "/normal.pfm", p.normal, p.width, p.height, 3);
+    if (!p.albedo.empty()) {
+        save_pfm(dir + "/albedo_linear.pfm", p.albedo, p.width, p.height, 3);
+        nn::Image img;
+        img.width = p.width;
+        img.height = p.height;
+        img.data.resize(p.albedo.size());
+        for (size_t i = 0; i < p.albedo.size(); ++i)
+            img.data[i] = (uint8_t)std::lround(255.0f * srgb_encode(p.albedo[i]));
+        save_png(img, dir + "/albedo_srgb.png");
+    }
     if (!p.depth_log.empty()) {
         float lo = 1e9f, hi = -1e9f;
         for (float v : p.depth_log) lo = std::fmin(lo, v), hi = std::fmax(hi, v);
@@ -163,7 +195,7 @@ void save_outputs(const Prediction& p, const std::string& dir) {
         for (size_t i = 0; i < p.depth_log.size(); ++i)
             img.data[i * 3] = img.data[i * 3 + 1] = img.data[i * 3 + 2] =
                 (uint8_t)std::lround(255.0f * (p.depth_log[i] - lo) / std::fmax(hi - lo, 1e-6f));
-        nn::save_image(img, dir + "/depth.png", -1);
+        save_png(img, dir + "/depth.png");
     }
     if (!p.normal.empty()) {
         nn::Image img;
@@ -176,7 +208,7 @@ void save_outputs(const Prediction& p, const std::string& dir) {
             for (int c = 0; c < 3; ++c)
                 img.data[i * 3 + c] = (uint8_t)std::lround(127.5f + 127.5f * v[c]);
         }
-        nn::save_image(img, dir + "/normal.png", -1);
+        save_png(img, dir + "/normal.png");
     }
 }
 
@@ -184,10 +216,11 @@ int run_prediction(const std::string& image, const std::string& npy, const std::
                    int tokens, int repeat, int batch, const std::string& out,
                    bool synthetic = false) {
     std::printf("Prediction\n");
-    const bool d = tasks.find("depth") != std::string::npos || tasks == "both";
-    const bool n = tasks.find("normal") != std::string::npos || tasks == "both";
+    const bool d = tasks.find("depth") != std::string::npos || tasks == "both" || tasks == "all";
+    const bool n = tasks.find("normal") != std::string::npos || tasks == "both" || tasks == "all";
+    const bool al = tasks.find("albedo") != std::string::npos || tasks == "all";
     if (!base_installed() || (d && !task_installed(Task::Depth)) ||
-        (n && !task_installed(Task::Normals))) {
+        (n && !task_installed(Task::Normals)) || (al && !task_installed(Task::Albedo))) {
         std::printf("  SKIP not installed\n");
         return 0;
     }
@@ -221,11 +254,12 @@ int run_prediction(const std::string& image, const std::string& npy, const std::
     }
     Predictor pred;
     double t0 = now_ms();
-    pred.load(d, n);
+    pred.load(d, n, al);
     std::printf("  loaded in %.1f s\n", (now_ms() - t0) / 1000.0);
     PredictOptions o;
     o.want_depth = d;
     o.want_normal = n;
+    o.want_albedo = al;
     o.num_tokens = tokens;
     int pw, ph;
     Predictor::processingSize(w, h, tokens, &pw, &ph);
@@ -250,7 +284,7 @@ int run_prediction(const std::string& image, const std::string& npy, const std::
     if (batch > 1) {
         const std::vector<Prediction> one = pred.predict({{rgb.data(), w, h}}, o);
         check(one[0].depth_log == p[0].depth_log && one[0].normal == p[0].normal &&
-                  p[2 % batch].depth_log == p[0].depth_log,
+                  one[0].albedo == p[0].albedo && p[2 % batch].depth_log == p[0].depth_log,
               "a batch gives each image what it gets alone");
     }
     std::printf("  device %.2f GB, peak allocation %.2f GB\n", pred.deviceBytes() / 1e9,
@@ -260,6 +294,7 @@ int run_prediction(const std::string& image, const std::string& npy, const std::
     bool finite = true;
     for (float v : p[0].depth_log) finite = finite && std::isfinite(v);
     for (float v : p[0].normal) finite = finite && std::isfinite(v);
+    for (float v : p[0].albedo) finite = finite && std::isfinite(v);
     check(finite, "prediction is finite");
     return 0;
 }
@@ -463,7 +498,9 @@ int main(int argc, char** argv) {
         else if (a == "--constants" && i + 1 < argc) constants = argv[++i];
         else if (a == "--task" && i + 1 < argc) {
             tasks = argv[++i];
-            task = tasks == "normals" ? Task::Normals : Task::Depth;
+            task = tasks == "normals" ? Task::Normals
+                   : tasks == "albedo" ? Task::Albedo
+                                       : Task::Depth;
         }
         else if (a == "--image" && i + 1 < argc) image = argv[++i];
         else if (a == "--rgb" && i + 1 < argc) npy = argv[++i];
@@ -479,7 +516,8 @@ int main(int argc, char** argv) {
         if (!to_install.empty()) {
             const bool d = to_install.find("depth") != std::string::npos;
             const bool n = to_install.find("normal") != std::string::npos;
-            const InstallNeeds need = install_needs(d, n);
+            const bool al = to_install.find("albedo") != std::string::npos;
+            const InstallNeeds need = install_needs(d, n, al);
             std::printf("to stream %.2f GB, to write %.2f GB, %.1f GB free\n",
                         need.download / 1e9, need.disk / 1e9, need.free / 1e9);
             const double t0 = now_ms();
@@ -491,7 +529,7 @@ int main(int argc, char** argv) {
                 std::printf("\r  %.2f / %.2f GB  %.1f MB/s   ", done / 1e9, total / 1e9,
                             done / 1e3 / std::fmax(now - t0, 1.0));
                 std::fflush(stdout);
-            }, nullptr);
+            }, nullptr, al);
             std::printf("\ninstalled in %.0f s\n", (now_ms() - t0) / 1000.0);
             return 0;
         }

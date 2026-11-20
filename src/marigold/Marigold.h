@@ -1,7 +1,7 @@
 #pragma once
-// Marigold v2 (huawei-bayerlab): monocular depth and surface normals from
-// Qwen-Image-Edit-2509, a 20B-parameter DiT fine-tuned to predict them in one
-// step. The public surface of src/marigold/; README.md beside it has the design.
+// Marigold v2 (huawei-bayerlab): monocular depth, surface normals and albedo
+// from Qwen-Image-Edit-2509, a 20B-parameter DiT fine-tuned to predict them in
+// one step. The public surface of src/marigold/; README.md beside it has the design.
 //
 // Two conventions a caller has to know:
 //   * Depth is affine in LOG depth: log z = a + b * depth_log for unknown a and
@@ -21,6 +21,7 @@ struct Prediction {
     int width = 0, height = 0;
     std::vector<float> depth_log;   // [H*W], empty unless asked for
     std::vector<float> normal;      // [H*W*3], empty unless asked for
+    std::vector<float> albedo;      // [H*W*3] linear RGB in [0, 1], empty unless asked for
 };
 
 struct PredictOptions {
@@ -30,6 +31,7 @@ struct PredictOptions {
     // An image holding more is downscaled to this; one holding fewer runs at
     // its own size, rounded to a multiple of 16.
     int num_tokens = 3600;
+    bool want_albedo = false;
 };
 
 class Predictor {
@@ -41,7 +43,7 @@ public:
 
     // Throws unless what is asked for is installed (model/Install.h): the
     // install is tens of GB, which the caller asks about first.
-    void load(bool want_depth, bool want_normal);
+    void load(bool want_depth, bool want_normal, bool want_albedo = false);
     bool loaded() const;
 
     // width*height*3 floats in 0..1 (sRGB). Images that the network sees at

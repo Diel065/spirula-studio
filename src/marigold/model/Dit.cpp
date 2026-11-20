@@ -138,7 +138,7 @@ uint64_t Dit::deviceBytes() const {
 }
 
 uint64_t Dit::arenaBytes(int64_t tokens, int batch) const {
-    const int64_t L = std::max(text_tokens_[0], text_tokens_[1]);
+    const int64_t L = *std::max_element(text_tokens_, text_tokens_ + kTasks);
     const int64_t all = (int64_t)batch * (tokens + L), img = (int64_t)batch * tokens;
     // The two streams, and the larger of the attention's live set (LayerNorm,
     // fused qkv, attention out) and the MLP's (LayerNorm, hidden).

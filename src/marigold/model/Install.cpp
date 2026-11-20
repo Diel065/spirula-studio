@@ -693,7 +693,9 @@ void build_task(Task t, const std::function<void(uint64_t)>& moved,
 // What is there
 // ================
 
-bool format_is(const std::string& path, const char* format) {
+// `task`, when given, must be the task the file says it holds: a task file copied
+// under another task's name would pass the format alone.
+bool format_is(const std::string& path, const char* format, const char* task = nullptr) {
     static std::mutex mu;
     static std::map<std::string, std::pair<std::string, bool>> seen;
     std::error_code ec;
@@ -708,6 +710,10 @@ bool format_is(const std::string& path, const char* format) {
         const nn::SafetensorsFile f(path);
         auto m = f.metadata().find("format");
         ok = m != f.metadata().end() && m->second == format;
+        if (task) {
+            auto k = f.metadata().find("task");
+            ok = ok && k != f.metadata().end() && k->second == task;
+        }
     } catch (const std::exception&) {
     }
     seen[path] = {stamp, ok};
@@ -776,11 +782,11 @@ private:
 }  // namespace
 
 bool base_installed() { return format_is(base_path(), kBaseFormat); }
-bool task_installed(Task t) { return format_is(task_path(t), kTaskFormat); }
+bool task_installed(Task t) { return format_is(task_path(t), kTaskFormat, task_name(t)); }
 
 bool InstallNeeds::fits() const { return free >= disk + kDiskSpare; }
 
-InstallNeeds install_needs(bool depth, bool normals) {
+InstallNeeds install_needs(bool depth, bool normals, bool albedo) {
     InstallNeeds n;
     if (!base_installed()) {
         std::vector<uint64_t> b;
@@ -788,8 +794,10 @@ InstallNeeds install_needs(bool depth, bool normals) {
         b.push_back(vae_file().bytes);
         add_needs(n, base_path(), b, base_install_bytes());
     }
-    for (Task t : {Task::Depth, Task::Normals}) {
-        if ((t == Task::Depth ? !depth : !normals) || task_installed(t)) continue;
+    const bool want[kTasks] = {depth, normals, albedo};
+    for (int k = 0; k < kTasks; ++k) {
+        const Task t = (Task)k;
+        if (!want[k] || task_installed(t)) continue;
         add_needs(n, task_path(t), {trainables(t).bytes}, task_install_bytes());
         n.download += prompt_embeds(t).bytes + prompt_mask(t).bytes;
     }
@@ -798,8 +806,8 @@ InstallNeeds install_needs(bool depth, bool normals) {
 }
 
 void install(bool depth, bool normals, const InstallProgress& progress,
-             const std::atomic<bool>* cancel) {
-    const InstallNeeds needs = install_needs(depth, normals);
+             const std::atomic<bool>* cancel, bool albedo) {
+    const InstallNeeds needs = install_needs(depth, normals, albedo);
     if (needs.download == 0) return;
     NN_CHECK(needs.fits(),
              "installing Marigold v2 writes %.1f GB more under %s, and that disk has %.1f GB "
@@ -828,8 +836,10 @@ void install(bool depth, bool normals, const InstallProgress& progress,
         b.push_back(vae_file().bytes);
         build_base(counter(streamed(base_path(), b)), cancel);
     }
-    for (Task t : {Task::Depth, Task::Normals}) {
-        if ((t == Task::Depth ? !depth : !normals) || task_installed(t)) continue;
+    const bool want[kTasks] = {depth, normals, albedo};
+    for (int k = 0; k < kTasks; ++k) {
+        const Task t = (Task)k;
+        if (!want[k] || task_installed(t)) continue;
         build_task(t, counter(streamed(task_path(t), {trainables(t).bytes})), cancel);
     }
 }
