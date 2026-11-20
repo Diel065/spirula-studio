@@ -144,20 +144,36 @@ uint64_t Streamer::plan(uint64_t bytes) {
     if ((int)resident_units_.size() < want) {
         std::vector<uint8_t> host((size_t)unit);
         for (int i = (int)resident_units_.size(); i < want; ++i) {
-            const nn::DevicePtr p = vk::Allocator::get().allocDevice(unit, "marigold.block");
+            // Owned before it is filled, so a failed read or upload does not leak it.
+            resident_units_.push_back(vk::Allocator::get().allocDevice(unit, "marigold.block"));
             readUnit(i, resident_task_, host.data(), true, resident_lora_);
-            vk::Stream::get().upload(p, host.data(), resident_lora_ ? unit : base_bytes_);
-            resident_units_.push_back(p);
+            vk::Stream::get().upload(resident_units_.back(), host.data(),
+                                     resident_lora_ ? unit : base_bytes_);
         }
     }
     resident_ = want;
-    if (resident_ < kLayers && !slots_[0])
-        for (int k = 0; k < 2; ++k) {
-            slots_[k] = vk::Allocator::get().allocDeviceShared(unit, "marigold.slot");
-            void* map = nullptr;
-            staging_[k] = vk::Allocator::get().allocHost(unit, &map, "marigold.staging");
-            staging_map_[k] = static_cast<uint8_t*>(map);
+    // slots_[0] says all four buffers exist: a retry after a failed allocation redoes them.
+    if (resident_ < kLayers && !slots_[0]) {
+        nn::DevicePtr slot[2] = {}, staging[2] = {};
+        void* map[2] = {};
+        try {
+            for (int k = 0; k < 2; ++k) {
+                slot[k] = vk::Allocator::get().allocDeviceShared(unit, "marigold.slot");
+                staging[k] = vk::Allocator::get().allocHost(unit, &map[k], "marigold.staging");
+            }
+        } catch (...) {
+            for (int k = 0; k < 2; ++k) {
+                vk::Allocator::get().free(slot[k]);
+                vk::Allocator::get().free(staging[k]);
+            }
+            throw;
         }
+        for (int k = 0; k < 2; ++k) {
+            slots_[k] = slot[k];
+            staging_[k] = staging[k];
+            staging_map_[k] = static_cast<uint8_t*>(map[k]);
+        }
+    }
     NN_LOG_INFO("[marigold] %d of %d blocks resident (%.1f GB), %s\n", resident_, kLayers,
                 resident_ * (double)unit / 1e9,
                 resident_ == kLayers ? "nothing streamed"

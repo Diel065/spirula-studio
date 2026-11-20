@@ -22,6 +22,11 @@ namespace marigold {
 
 class Dit {
 public:
+    Dit() = default;
+    ~Dit() { release(); }
+    Dit(const Dit&) = delete;
+    Dit& operator=(const Dit&) = delete;
+
     void load(const nn::SafetensorsFile& base);
     void loadTask(Task t, const nn::SafetensorsFile& task);
     void release();

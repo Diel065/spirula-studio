@@ -138,10 +138,18 @@ void Predictor::load(bool want_depth, bool want_normal) {
              "Marigold v2 is not installed: `spirula geometry --install marigold-v2` builds it "
              "from Hugging Face's checkpoints (about 45 GB streamed, 11 GB kept)");
     if (!m.base) {
-        m.base = std::make_unique<nn::SafetensorsFile>(base_path());
-        m.encoder.load(*m.base, true, "marigold.encoder");
-        m.dit.load(*m.base);
-        m.streamer.addBase(*m.base);
+        // m.base is what says the base is loaded: set only once all of it is.
+        auto base = std::make_unique<nn::SafetensorsFile>(base_path());
+        try {
+            m.encoder.load(*base, true, "marigold.encoder");
+            m.dit.load(*base);
+            m.streamer.addBase(*base);
+        } catch (...) {
+            m.encoder.release();
+            m.dit.release();
+            throw;
+        }
+        m.base = std::move(base);
     }
     for (Task t : {Task::Depth, Task::Normals}) {
         const int k = (int)t;
