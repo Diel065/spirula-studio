@@ -23,7 +23,7 @@ private:
     std::string dir_;
 };
 
-// A .npy of float32 into `data`; false when unreadable.
+// A C-order .npy of float32 into `data`; false when unreadable or truncated.
 bool read_npy_f32(const std::string& path, std::vector<float>& data,
                   std::vector<int64_t>& shape);
 void write_npy_f32(const std::string& path, const float* data,
